@@ -1,7 +1,7 @@
-fastapi
-uvicorn
-pypdf
-anthropic
+flask
+flask-cors
+gunicorn
 supabase
-reportlab
-python-multipart
+python-dotenv
+openai
+pdf-parse
