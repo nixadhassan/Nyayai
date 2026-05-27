@@ -1,5 +1,6 @@
 import io
 import os
+import base64
 from fastapi import FastAPI, UploadFile, File, HTTPException, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +8,7 @@ import pypdf
 import anthropic
 from supabase import create_client, Client
 
-app = FastAPI(title="NYAY AI Production Backend with Supabase")
+app = FastAPI(title="NYAY AI Multi-File Production Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,7 +18,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Fetch Environment Keys Securely from Render Settings Matrix
 CLAUDE_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
@@ -25,7 +25,6 @@ SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 if not all([CLAUDE_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
     raise RuntimeError("CRITICAL ERROR: Missing backend cloud environment variables!")
 
-# Initialize Third-Party Cloud Engines
 anthropic_client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
 supabase_client: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
@@ -45,7 +44,7 @@ def home():
 
 @app.post("/api/analyze")
 async def analyze_document(
-    file: UploadFile = File(...), 
+    files: list[UploadFile] = File(...), 
     authorization: str = Header(None)
 ):
     if not authorization or not authorization.startswith("Bearer "):
@@ -54,48 +53,78 @@ async def analyze_document(
     user_id = authorization.split(" ")[1]
     
     try:
-        # 1. Query Supabase to pull real-time record configuration values
+        # 1. Query Supabase for credit tracking
         db_query = supabase_client.table("users").select("*").eq("id", user_id).execute()
         user_records = db_query.data
         
         if not user_records:
-            # First time user interacts with our app: Provision empty entry row record maps
             current_usage = 0
             supabase_client.table("users").insert({"id": user_id, "credits_used": 0}).execute()
         else:
             current_usage = user_records[0]["credits_used"]
 
-        # 2. Hard credit checks
         if current_usage >= 2:
             return {"status": "PAYWALL_TRIGGERED", "message": "Free limit reached."}
 
-        if not file.filename.endswith('.pdf'):
-            raise HTTPException(status_code=400, detail="Only PDF files are supported.")
+        # 2. Build Multimodal Content Payload for Claude API
+        content_list = []
+        combined_pdf_text = ""
 
-        # 3. Read and process payload text
-        file_bytes = await file.read()
-        document_text = extract_text_from_pdf(file_bytes)
-        
-        if not document_text.strip():
-            raise HTTPException(status_code=400, detail="PDF is empty or scanned as an image.")
+        for file in files:
+            file_bytes = await file.read()
+            filename_lower = file.filename.lower()
 
-        # 4. Request Analysis from Claude Engine
+            if filename_lower.endswith('.pdf'):
+                text = extract_text_from_pdf(file_bytes)
+                combined_pdf_text += f"\n--- Extracted Text from {file.filename} ---\n{text}\n"
+            
+            elif filename_lower.endswith(('.png', '.jpg', '.jpeg', '.webp')):
+                encoded_image = base64.b64encode(file_bytes).decode("utf-8")
+                
+                media_type = "image/jpeg"
+                if filename_lower.endswith('.png'): media_type = "image/png"
+                elif filename_lower.endswith('.webp'): media_type = "image/webp"
+
+                content_list.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": encoded_image
+                    }
+                })
+            else:
+                raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
+
+        if combined_pdf_text.strip():
+            content_list.append({
+                "type": "text",
+                "text": f"Here is text extracted from matching uploaded document templates:\n{combined_pdf_text}"
+            })
+
+        # Append the core legal instruction prompt matrix
+        content_list.append({
+            "type": "text",
+            "text": "Analyze the provided legal items (images and/or documents). Provide a clear, structured analysis containing: 1. Executive Summary, 2. Key Obligations, 3. Critical Red Flags/Risks under Indian Law, and 4. Actionable Recommendations. Use clean bullet points and clear headings."
+        })
+
+        if not content_list or len(content_list) <= 1:
+            raise HTTPException(status_code=400, detail="No readable content or images were uploaded.")
+
+        # 3. Fire request to Claude Multi-Modal Vision Engine
         response = anthropic_client.messages.create(
             model="claude-3-haiku-20240307",
             max_tokens=2000,
             temperature=0.1,
-            system="You are NYAY AI, an expert senior advocate and deed writer assistant in India. "
-                   "Analyze the provided legal text. Provide a clear, structured analysis containing: "
-                   "1. Executive Summary, 2. Key Obligations, 3. Critical Red Flags/Risks under Indian Law, "
-                   "and 4. Actionable Recommendations. Use clean bullet points and clear headings.",
+            system="You are NYAY AI, an expert senior advocate and deed writer assistant in India.",
             messages=[
-                {"role": "user", "content": f"Analyze this legal document:\n\n{document_text}"}
+                {"role": "user", "content": content_list}
             ]
         )
         
         analysis_result = response.content[0].text
         
-        # 5. Push updated tracking state out to Supabase Cloud Storage
+        # 4. Save consumption credit incrementation
         new_usage = current_usage + 1
         supabase_client.table("users").update({"credits_used": new_usage}).eq("id", user_id).execute()
         remaining_free = max(0, 2 - new_usage)
@@ -107,7 +136,7 @@ async def analyze_document(
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database or Processing failure: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"System Error: {str(e)}")
 
 @app.post("/api/generate-pdf")
 async def generate_pdf(data: dict):
@@ -139,4 +168,4 @@ async def generate_pdf(data: dict):
         pdf_buffer, 
         media_type="application/pdf", 
         headers={"Content-Disposition": "attachment; filename=NYAY_AI_Analysis.pdf"}
-    )
+        )
