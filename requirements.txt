@@ -2,6 +2,4 @@ flask
 flask-cors
 gunicorn
 supabase
-python-dotenv
-openai
 pdfplumber
