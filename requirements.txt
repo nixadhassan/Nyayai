@@ -4,4 +4,4 @@ gunicorn
 supabase
 python-dotenv
 openai
-pdf-parse
+pdfplumber
